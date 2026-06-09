@@ -307,11 +307,23 @@ class CRMApp:
         self.db_conn = sqlite3.connect(db_path, check_same_thread=False)
         self.create_table()
 
+        # Notebook Setup
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(fill="both", expand=True)
+
+        # Tab 1: Contacts
+        self.contacts_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.contacts_tab, text="Contacts")
+
+        # Tab 2: Today's Follow-ups
+        self.followups_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.followups_tab, text="Today's Follow-ups")
+
         # Layout Setup
-        left_frame = tk.Frame(root)
+        left_frame = tk.Frame(self.contacts_tab)
         left_frame.pack(side="left", fill="y", padx=(0, 10))
 
-        right_frame = tk.Frame(root)
+        right_frame = tk.Frame(self.contacts_tab)
         right_frame.pack(side="left", fill="both", expand=True)
 
         # Left Frame: Search, Summary, and Listbox
@@ -400,6 +412,9 @@ class CRMApp:
         self.status_var.set("Ready")
         ttk.Label(right_frame, textvariable=self.status_var, font=("Helvetica", 8, "italic"), foreground="gray").pack(anchor="w")
 
+        # Setup Today's Follow-ups Tab
+        self.setup_followups_tab()
+
         # State Variables
         self.save_timer = None
         self.is_loading = False
@@ -418,6 +433,14 @@ class CRMApp:
                 follow_up_count INTEGER DEFAULT 0,
                 passport_number TEXT,
                 latest_followup_date TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS followup_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                contact_name TEXT,
+                timestamp TEXT,
+                date TEXT
             )
         ''')
         # Backward compatibility checks
@@ -512,7 +535,7 @@ class CRMApp:
         new_name = self.name_var.get().strip()
         if not new_name:
             self.status_var.set("Name cannot be empty.")
-            return
+            return False
             
         number = self.number_var.get().strip()
         passport = self.passport_var.get().strip()
@@ -533,6 +556,11 @@ class CRMApp:
                     SET name = ?, number = ?, notes = ?, follow_up_count = ?, passport_number = ?, latest_followup_date = ?
                     WHERE name = ?
                 ''', (new_name, number, notes, followup, passport, latest_followup, self.current_contact_id))
+                cursor.execute('''
+                    UPDATE followup_logs
+                    SET contact_name = ?
+                    WHERE contact_name = ?
+                ''', (new_name, self.current_contact_id))
                 self.current_contact_id = new_name
             else:
                 # Insert or update
@@ -560,9 +588,11 @@ class CRMApp:
                 if self.contact_names[i] == new_name:
                     self.listbox.selection_set(i)
                     break
+            return True
                     
         except sqlite3.IntegrityError:
             self.status_var.set("Error: Contact name already exists.")
+            return False
 
     def delete_contact(self):
         from tkinter import messagebox
@@ -581,6 +611,7 @@ class CRMApp:
         if confirm:
             cursor = self.db_conn.cursor()
             cursor.execute("DELETE FROM contacts WHERE name = ?", (name,))
+            cursor.execute("DELETE FROM followup_logs WHERE contact_name = ?", (name,))
             self.db_conn.commit()
             
             # Clear UI if the deleted contact was currently loaded
@@ -624,6 +655,9 @@ class CRMApp:
     def increment_followup(self):
         if self.is_loading:
             return
+        contact_name = self.name_var.get().strip()
+        if not contact_name:
+            return
         try:
             val = int(self.followup_var.get())
         except ValueError:
@@ -633,7 +667,16 @@ class CRMApp:
         # Set latest follow-up date to today
         self.latest_followup_var.set(datetime.date.today().strftime("%Y-%m-%d"))
         
-        self.save_data()
+        if self.save_data():
+            # Log the follow-up
+            now = datetime.datetime.now()
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                "INSERT INTO followup_logs (contact_name, timestamp, date) VALUES (?, ?, ?)",
+                (contact_name, now.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d"))
+            )
+            self.db_conn.commit()
+            self.refresh_followups_tab()
 
     def open_calendar_picker(self):
         if self.is_loading:
@@ -665,19 +708,46 @@ class CRMApp:
     def decrement_followup(self):
         if self.is_loading:
             return
+        contact_name = self.name_var.get().strip()
+        if not contact_name:
+            return
         try:
             val = int(self.followup_var.get())
         except ValueError:
             val = 0
         if val > 0:
             self.followup_var.set(str(val - 1))
-            self.save_data()
+            if self.save_data():
+                # Remove the most recent log entry for today for this contact
+                cursor = self.db_conn.cursor()
+                today_str = datetime.date.today().strftime("%Y-%m-%d")
+                cursor.execute(
+                    "SELECT id FROM followup_logs WHERE contact_name = ? AND date = ? ORDER BY timestamp DESC LIMIT 1",
+                    (contact_name, today_str)
+                )
+                row = cursor.fetchone()
+                if row:
+                    cursor.execute("DELETE FROM followup_logs WHERE id = ?", (row[0],))
+                    self.db_conn.commit()
+                self.refresh_followups_tab()
             
     def reset_followup(self):
         if self.is_loading:
             return
+        contact_name = self.name_var.get().strip()
+        if not contact_name:
+            return
         self.followup_var.set("0")
-        self.save_data()
+        if self.save_data():
+            # Delete all log entries for today for this contact
+            cursor = self.db_conn.cursor()
+            today_str = datetime.date.today().strftime("%Y-%m-%d")
+            cursor.execute(
+                "DELETE FROM followup_logs WHERE contact_name = ? AND date = ?",
+                (contact_name, today_str)
+            )
+            self.db_conn.commit()
+            self.refresh_followups_tab()
 
     def update_total_followups(self):
         cursor = self.db_conn.cursor()
@@ -685,6 +755,123 @@ class CRMApp:
         result = cursor.fetchone()
         total = result[0] if result[0] is not None else 0
         self.total_followups_var.set(f"Total Follow-ups: {total}")
+
+    def setup_followups_tab(self):
+        # Header frame for stats
+        header_frame = tk.Frame(self.followups_tab, bg="#f5f6f8", pady=15, padx=15)
+        header_frame.pack(fill="x", side="top")
+        
+        self.date_label = ttk.Label(
+            header_frame, 
+            text="", 
+            font=("Helvetica", 11, "bold"), 
+            background="#f5f6f8", 
+            foreground="#555555"
+        )
+        self.date_label.pack(anchor="w")
+        
+        self.stats_label = ttk.Label(
+            header_frame, 
+            text="Follow-ups Completed Today: 0", 
+            font=("Helvetica", 14, "bold"), 
+            background="#f5f6f8", 
+            foreground="#2e7d32"
+        )
+        self.stats_label.pack(anchor="w", pady=(5, 0))
+
+        # Divider line
+        divider = ttk.Separator(self.followups_tab, orient="horizontal")
+        divider.pack(fill="x")
+
+        # Treeview frame for list
+        list_frame = tk.Frame(self.followups_tab, padx=15, pady=15)
+        list_frame.pack(fill="both", expand=True)
+
+        ttk.Label(list_frame, text="Log of Today's Follow-ups:", font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(0, 5))
+
+        # Create Treeview
+        columns = ("time", "name")
+        self.followups_tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=10)
+        self.followups_tree.heading("time", text="Time")
+        self.followups_tree.heading("name", text="Contact Name")
+        
+        self.followups_tree.column("time", width=120, minwidth=100, stretch=tk.NO)
+        self.followups_tree.column("name", width=350, minwidth=200, stretch=tk.YES)
+        
+        # Scrollbar for treeview
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.followups_tree.yview)
+        self.followups_tree.configure(yscrollcommand=scrollbar.set)
+        
+        self.followups_tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Bind double click
+        self.followups_tree.bind("<Double-Button-1>", self.on_double_click_followup)
+        
+        # Help label
+        help_label = ttk.Label(
+            self.followups_tab, 
+            text="Double-click a row to open the contact in the Contacts tab.", 
+            font=("Helvetica", 9, "italic"), 
+            foreground="gray",
+            padding=(15, 5)
+        )
+        help_label.pack(anchor="w", side="bottom")
+        
+        # Bind Notebook Tab changed event
+        self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_changed)
+
+    def on_tab_changed(self, event):
+        selected_tab_idx = self.notebook.index(self.notebook.select())
+        if selected_tab_idx == 1:
+            self.refresh_followups_tab()
+
+    def refresh_followups_tab(self):
+        if not hasattr(self, 'followups_tree'):
+            return
+        # Update today's date label
+        today = datetime.date.today()
+        self.date_label.config(text=today.strftime("%A, %B %d, %Y"))
+
+        # Fetch all follow-ups for today
+        today_str = today.strftime("%Y-%m-%d")
+        cursor = self.db_conn.cursor()
+        cursor.execute(
+            "SELECT timestamp, contact_name FROM followup_logs WHERE date = ? ORDER BY timestamp DESC", 
+            (today_str,)
+        )
+        rows = cursor.fetchall()
+        
+        # Clear existing treeview entries
+        for item in self.followups_tree.get_children():
+            self.followups_tree.delete(item)
+            
+        # Populate treeview
+        for row in rows:
+            try:
+                dt = datetime.datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+                time_str = dt.strftime("%I:%M %p")
+            except ValueError:
+                time_str = row[0]
+            self.followups_tree.insert("", tk.END, values=(time_str, row[1]))
+            
+        # Update summary label
+        count = len(rows)
+        self.stats_label.config(text=f"Follow-ups Completed Today: {count}")
+
+    def on_double_click_followup(self, event):
+        selected_item = self.followups_tree.focus()
+        if not selected_item:
+            return
+        item_values = self.followups_tree.item(selected_item, "values")
+        if len(item_values) >= 2:
+            contact_name = item_values[1]
+            
+            # Switch back to Contacts tab (index 0)
+            self.notebook.select(self.contacts_tab)
+            
+            # Select contact in listbox
+            self.select_contact_by_name(contact_name)
 
 if __name__ == "__main__":
     root = tk.Tk()
